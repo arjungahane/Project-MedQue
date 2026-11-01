@@ -1,0 +1,26 @@
+{
+  "name": "medqueue",
+  "version": "1.0.0",
+  "description": "MedQueue - Smart Hospital Queue Management System",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "preview": "npm --prefix frontend run preview",
+    "lint": "npm --prefix frontend run lint"
+  },
+  "keywords": [
+    "hospital",
+    "queue-management",
+    "healthcare",
+    "queueing-theory",
+    "react",
+    "supabase",
+    "netlify"
+  ],
+  "author": "MedQueue Team",
+  "license": "MIT",
+  "devDependencies": {
+    "@netlify/functions": "^6.0.3"
+  }
+}
