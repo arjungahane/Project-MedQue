@@ -50,6 +50,9 @@ export interface Doctor {
   qualification: string;
   experience_years: number;
   avg_consultation_minutes: number;
+  available_days?: string[];
+  start_time?: string;
+  end_time?: string;
   is_available: boolean;
   current_token?: string;
 }
@@ -75,6 +78,7 @@ export interface Appointment {
   doctor?: Doctor;
   appointment_date: string;
   appointment_time: string;
+  duration_minutes?: number;
   appointment_type: 'ONLINE' | 'WALKIN';
   status: 'CONFIRMED' | 'CHECKED_IN' | 'IN_PROGRESS' | 'COMPLETED' | 'CANCELLED';
   reason?: string;

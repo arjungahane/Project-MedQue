@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { 
   QrCode, 
   Clock, 
@@ -17,7 +17,14 @@ import {
 import { useAuth } from '../context/AuthContext';
 import { useQueue } from '../context/QueueContext';
 import { QueueTicketModal } from '../components/QueueTicketModal';
-import { PriorityLevel, QueueToken } from '../types';
+import { Appointment, PriorityLevel, QueueToken } from '../types';
+import { isSupabaseConfigured, supabase } from '../lib/supabase';
+import {
+  APPOINTMENT_BUFFER_MINUTES,
+  AppointmentSlot,
+  getAvailableAppointmentSlots,
+  getLocalDateValue,
+} from '../lib/appointmentScheduling';
 import confetti from 'canvas-confetti';
 
 export const PatientDashboard: React.FC = () => {
@@ -43,9 +50,22 @@ export const PatientDashboard: React.FC = () => {
 
   // Online appointment booking state
   const [showOnlineBooking, setShowOnlineBooking] = useState(false);
-  const [appointmentDate, setAppointmentDate] = useState(() => new Date().toISOString().split('T')[0]);
-  const [appointmentTime, setAppointmentTime] = useState('10:00');
+  const [appointmentDate, setAppointmentDate] = useState(() => getLocalDateValue(new Date()));
+  const [appointmentTime, setAppointmentTime] = useState('');
   const [selectedDoctorId, setSelectedDoctorId] = useState('');
+  const [bookingMode, setBookingMode] = useState<'APPOINTMENT' | 'WALKIN'>('APPOINTMENT');
+  const [appointments, setAppointments] = useState<Appointment[]>(() => {
+    const saved = localStorage.getItem('medqueue_appointments');
+    return saved ? JSON.parse(saved) as Appointment[] : [];
+  });
+  const [availableSlots, setAvailableSlots] = useState<AppointmentSlot[]>([]);
+  const [availabilityLoading, setAvailabilityLoading] = useState(false);
+  const [availabilityError, setAvailabilityError] = useState('');
+  const [bookingError, setBookingError] = useState('');
+  const [bookingNotice, setBookingNotice] = useState('');
+  const [appointmentSubmitting, setAppointmentSubmitting] = useState(false);
+  const [availabilityVersion, setAvailabilityVersion] = useState(0);
+  const [reschedulingAppointmentId, setReschedulingAppointmentId] = useState<string | null>(null);
 
   // Edit profile state
   const [isEditingProfile, setIsEditingProfile] = useState(false);
@@ -57,12 +77,269 @@ export const PatientDashboard: React.FC = () => {
   const activeToken = patientTokens.find(t => t.status === 'WAITING' || t.status === 'CALLED' || t.status === 'IN_CONSULTATION');
   const pastTokens = patientTokens.filter(t => t.id !== activeToken?.id);
 
+  const selectedDoctor = doctors.find(doctor =>
+    doctor.id === selectedDoctorId &&
+    doctor.department_id === selectedDeptId &&
+    doctor.is_available
+  );
+
+  useEffect(() => {
+    let active = true;
+    const loadAppointments = async () => {
+      if (isSupabaseConfigured && supabase) {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        if (sessionData.session) {
+          const { data, error } = await supabase.rpc('get_my_appointments');
+          if (error) throw error;
+          if (active) setAppointments((data || []) as Appointment[]);
+          return;
+        }
+      }
+      const saved = localStorage.getItem('medqueue_appointments');
+      if (active) setAppointments(saved ? JSON.parse(saved) as Appointment[] : []);
+    };
+    loadAppointments().catch(error => {
+      if (active) setBookingError(`Could not load appointments: ${error.message}`);
+    });
+    const syncLocalAppointments = (event: StorageEvent) => {
+      if (event.key === 'medqueue_appointments') {
+        setAppointments(event.newValue ? JSON.parse(event.newValue) as Appointment[] : []);
+        setAvailabilityVersion(version => version + 1);
+      }
+    };
+    window.addEventListener('storage', syncLocalAppointments);
+    return () => {
+      active = false;
+      window.removeEventListener('storage', syncLocalAppointments);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedDoctor || !appointmentDate) {
+      setAvailableSlots([]);
+      setAppointmentTime('');
+      setAvailabilityError('');
+      return undefined;
+    }
+
+    let active = true;
+    setAvailabilityLoading(true);
+    setAvailabilityError('');
+    setAvailableSlots([]);
+    setAppointmentTime('');
+    const loadSlots = async () => {
+      if (isSupabaseConfigured && supabase) {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        if (sessionData.session) {
+          const { data, error } = await supabase.rpc('get_appointment_slots', {
+            p_doctor_id: selectedDoctor.id,
+            p_date: appointmentDate,
+            p_exclude_appointment_id: reschedulingAppointmentId,
+          });
+          if (error) throw error;
+          return (data || []) as AppointmentSlot[];
+        }
+      }
+      return getAvailableAppointmentSlots(
+        appointmentDate,
+        selectedDoctor,
+        appointments,
+        new Date(),
+        reschedulingAppointmentId || undefined,
+      );
+    };
+    loadSlots()
+      .then(slots => { if (active) setAvailableSlots(slots); })
+      .catch(error => { if (active) setAvailabilityError(error.message || 'Could not load appointment availability.'); })
+      .finally(() => { if (active) setAvailabilityLoading(false); });
+    return () => { active = false; };
+  }, [selectedDoctor, appointmentDate, appointments, availabilityVersion, reschedulingAppointmentId]);
+
+  useEffect(() => {
+    if (!supabase || !isSupabaseConfigured) return undefined;
+    const channel = supabase
+      .channel(`appointment-availability-${selectedDeptId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'appointments' }, () => {
+        setAvailabilityVersion(version => version + 1);
+      })
+      .subscribe();
+    return () => { void supabase?.removeChannel(channel); };
+  }, [selectedDeptId]);
+
   // Active token queue position
   const activePosition = activeToken ? getQueuePositionForToken(activeToken.id) : 0;
   const servingToken = activeToken ? getServingToken(activeToken.department_id) : undefined;
 
+  useEffect(() => {
+    const assignedDoctors = doctors.filter(doctor =>
+      doctor.department_id === selectedDeptId && doctor.is_available
+    );
+    if (!assignedDoctors.some(doctor => doctor.id === selectedDoctorId)) {
+      setSelectedDoctorId(assignedDoctors[0]?.id || '');
+    }
+  }, [selectedDeptId, doctors, selectedDoctorId]);
+
+  const handleBookAppointment = async () => {
+    setBookingError('');
+    setBookingNotice('');
+    if (!user || !selectedDoctor || !appointmentTime) {
+      setBookingError('Choose an available doctor and time slot.');
+      return;
+    }
+    setAppointmentSubmitting(true);
+    try {
+      let bookedAppointment: Appointment | null = null;
+      let hasAuthenticatedSession = false;
+      if (isSupabaseConfigured && supabase) {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        hasAuthenticatedSession = Boolean(sessionData.session);
+        if (hasAuthenticatedSession) {
+          const { data, error } = reschedulingAppointmentId
+            ? await supabase.rpc('reschedule_appointment', {
+              p_appointment_id: reschedulingAppointmentId,
+              p_date: appointmentDate,
+              p_time: appointmentTime,
+            })
+            : await supabase.rpc('book_appointment', {
+              p_department_id: selectedDeptId,
+              p_doctor_id: selectedDoctor.id,
+              p_date: appointmentDate,
+              p_time: appointmentTime,
+              p_reason: patientNotes || null,
+            });
+          if (error) {
+            if (error.code === '23P01' || /already been booked|buffer/i.test(error.message)) {
+              throw new Error('This slot has already been booked. Please select another time.');
+            }
+            throw error;
+          }
+          bookedAppointment = (Array.isArray(data) ? data[0] : data) as Appointment;
+        }
+      }
+
+      if (!hasAuthenticatedSession) {
+        const latestAppointments = JSON.parse(
+          localStorage.getItem('medqueue_appointments') || '[]',
+        ) as Appointment[];
+        const latestSlots = getAvailableAppointmentSlots(
+          appointmentDate,
+          selectedDoctor,
+          latestAppointments,
+          new Date(),
+          reschedulingAppointmentId || undefined,
+        );
+        if (!latestSlots.some(slot => slot.appointment_time.slice(0, 5) === appointmentTime.slice(0, 5) && slot.available)) {
+          throw new Error('This slot has already been booked. Please select another time.');
+        }
+        const existingAppointment = reschedulingAppointmentId
+          ? latestAppointments.find(item => item.id === reschedulingAppointmentId)
+          : undefined;
+        if (reschedulingAppointmentId && !existingAppointment) {
+          throw new Error('The appointment being rescheduled is no longer available.');
+        }
+        bookedAppointment = existingAppointment
+          ? { ...existingAppointment, appointment_date: appointmentDate, appointment_time: appointmentTime }
+          : {
+            id: `demo-appt-${crypto.randomUUID()}`,
+            patient_id: user.id,
+            department_id: selectedDeptId,
+            doctor_id: selectedDoctor.id,
+            appointment_date: appointmentDate,
+            appointment_time: appointmentTime,
+            duration_minutes: selectedDoctor.avg_consultation_minutes,
+            appointment_type: 'ONLINE',
+            status: 'CONFIRMED',
+            reason: patientNotes || undefined,
+            created_at: new Date().toISOString(),
+          };
+        const confirmedAppointment = bookedAppointment;
+        if (!confirmedAppointment) throw new Error('The appointment service returned no booking confirmation.');
+        const nextAppointments = reschedulingAppointmentId
+          ? latestAppointments.map(item => item.id === confirmedAppointment.id ? confirmedAppointment : item)
+          : [confirmedAppointment, ...latestAppointments];
+        localStorage.setItem('medqueue_appointments', JSON.stringify(nextAppointments));
+        setAppointments(nextAppointments);
+      } else {
+        const confirmedAppointment = bookedAppointment;
+        if (!confirmedAppointment) throw new Error('The appointment service returned no booking confirmation.');
+        setAppointments(previous => reschedulingAppointmentId
+          ? previous.map(item => item.id === confirmedAppointment.id ? confirmedAppointment : item)
+          : [confirmedAppointment, ...previous]);
+      }
+
+      setAppointmentTime('');
+      setPatientNotes('');
+      setBookingNotice(reschedulingAppointmentId
+        ? 'Appointment rescheduled. The previous time is available again.'
+        : hasAuthenticatedSession
+          ? 'Appointment confirmed. The selected slot is now unavailable.'
+          : 'Demo appointment saved in this browser. Sign in with Supabase to reserve a shared appointment slot.');
+      setReschedulingAppointmentId(null);
+      setAvailabilityVersion(version => version + 1);
+    } catch (error) {
+      setBookingError(error instanceof Error ? error.message : 'Appointment booking failed. Please try another slot.');
+    } finally {
+      setAppointmentSubmitting(false);
+    }
+  };
+
+  const handleCancelAppointment = async (appointment: Appointment) => {
+    setBookingError('');
+    setBookingNotice('');
+    try {
+      const { data: sessionData, error: sessionError } = supabase
+        ? await supabase.auth.getSession()
+        : { data: { session: null }, error: null };
+      if (sessionError) throw sessionError;
+      if (sessionData.session && supabase) {
+        const { data, error } = await supabase.rpc('cancel_appointment', {
+          p_appointment_id: appointment.id,
+        });
+        if (error) throw error;
+        const cancelled = (Array.isArray(data) ? data[0] : data) as Appointment;
+        setAppointments(previous => previous.map(item => item.id === cancelled.id ? cancelled : item));
+      } else {
+        const latestAppointments = JSON.parse(
+          localStorage.getItem('medqueue_appointments') || '[]',
+        ) as Appointment[];
+        const nextAppointments = latestAppointments.map(item =>
+          item.id === appointment.id ? { ...item, status: 'CANCELLED' as const } : item,
+        );
+        localStorage.setItem('medqueue_appointments', JSON.stringify(nextAppointments));
+        setAppointments(nextAppointments);
+      }
+      setBookingNotice('Appointment cancelled. Its time slot is available again.');
+      if (reschedulingAppointmentId === appointment.id) setReschedulingAppointmentId(null);
+      setAvailabilityVersion(version => version + 1);
+    } catch (error) {
+      setBookingError(error instanceof Error ? error.message : 'Could not cancel this appointment.');
+    }
+  };
+
+  const startRescheduling = (appointment: Appointment) => {
+    const appointmentDateValue = appointment.appointment_date < getLocalDateValue(new Date())
+      ? getLocalDateValue(new Date())
+      : appointment.appointment_date;
+    setSelectedDeptId(appointment.department_id);
+    setSelectedDoctorId(appointment.doctor_id || '');
+    setAppointmentDate(appointmentDateValue);
+    setAppointmentTime('');
+    setBookingMode('APPOINTMENT');
+    setReschedulingAppointmentId(appointment.id);
+    setBookingError('');
+    setBookingNotice('Choose a new time. Your current slot remains reserved until you confirm.');
+    setShowOnlineBooking(true);
+  };
+
   const handleCreateToken = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (bookingMode === 'APPOINTMENT') {
+      await handleBookAppointment();
+      return;
+    }
     if (!selectedDeptId) return;
     setIsGenerating(true);
 
@@ -177,7 +454,12 @@ export const PatientDashboard: React.FC = () => {
           )}
 
           <button
-            onClick={() => setShowOnlineBooking(prev => !prev)}
+            onClick={() => {
+              setShowOnlineBooking(previous => !previous);
+              setReschedulingAppointmentId(null);
+              setBookingMode('APPOINTMENT');
+              setAppointmentTime('');
+            }}
             className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold shadow-md shadow-sky-600/20 flex items-center gap-1.5"
           >
             <Plus className="w-4 h-4" />
@@ -295,11 +577,15 @@ export const PatientDashboard: React.FC = () => {
             <div className="flex items-center gap-2">
               <Calendar className="w-5 h-5 text-sky-600" />
               <h2 className="text-lg font-bold text-slate-900 dark:text-white">
-                Book Consultation or Instant Walk-in Token
+                {reschedulingAppointmentId ? 'Reschedule Appointment' : 'Book Consultation or Instant Walk-in Token'}
               </h2>
             </div>
             <button
-              onClick={() => setShowOnlineBooking(false)}
+              onClick={() => {
+                setShowOnlineBooking(false);
+                setReschedulingAppointmentId(null);
+                setAppointmentTime('');
+              }}
               className="text-xs text-slate-400 hover:text-slate-600"
             >
               Cancel
@@ -316,7 +602,15 @@ export const PatientDashboard: React.FC = () => {
                 </label>
                 <select
                   value={selectedDeptId}
-                  onChange={(e) => setSelectedDeptId(e.target.value)}
+                  disabled={Boolean(reschedulingAppointmentId)}
+                  onChange={(e) => {
+                    const departmentId = e.target.value;
+                    setSelectedDeptId(departmentId);
+                    setSelectedDoctorId(doctors.find(doctor =>
+                      doctor.department_id === departmentId && doctor.is_available
+                    )?.id || '');
+                    setAppointmentTime('');
+                  }}
                   className="w-full px-3 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-white"
                 >
                   {departments.map(dept => (
@@ -327,8 +621,26 @@ export const PatientDashboard: React.FC = () => {
                 </select>
               </div>
 
-              {/* Priority */}
               <div>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                  Booking Type
+                </label>
+                <select
+                  value={bookingMode}
+                  disabled={Boolean(reschedulingAppointmentId)}
+                  onChange={(e) => {
+                    setBookingMode(e.target.value as 'APPOINTMENT' | 'WALKIN');
+                    setBookingError('');
+                    setBookingNotice('');
+                  }}
+                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-white"
+                >
+                  <option value="APPOINTMENT">Scheduled appointment</option>
+                  <option value="WALKIN">Instant walk-in token</option>
+                </select>
+              </div>
+
+              {bookingMode === 'WALKIN' ? <div>
                 <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
                   Priority / Urgency
                 </label>
@@ -341,30 +653,32 @@ export const PatientDashboard: React.FC = () => {
                   <option value="PRIORITY">Priority / Senior Citizen / Urgent</option>
                   <option value="EMERGENCY">Emergency (Immediate Triage)</option>
                 </select>
-              </div>
-
-              {/* Doctor Selection (Optional) */}
-              <div>
+              </div> : <div>
                 <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Preferred Doctor (Optional)
+                  Doctor
                 </label>
                 <select
+                  required
                   value={selectedDoctorId}
-                  onChange={(e) => setSelectedDoctorId(e.target.value)}
+                  disabled={Boolean(reschedulingAppointmentId)}
+                  onChange={(e) => {
+                    setSelectedDoctorId(e.target.value);
+                    setAppointmentTime('');
+                  }}
                   className="w-full px-3 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-white"
                 >
-                  <option value="">Any Available Specialist</option>
-                  {doctors.filter(d => !selectedDeptId || d.department_id === selectedDeptId).map(doc => (
+                  <option value="" disabled>Select an available doctor</option>
+                  {doctors.filter(d => d.department_id === selectedDeptId && d.is_available).map(doc => (
                     <option key={doc.id} value={doc.id}>
                       {doc.specialization} ({doc.consultation_room})
                     </option>
                   ))}
                 </select>
-              </div>
+              </div>}
 
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {bookingMode === 'APPOINTMENT' && <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
                   Preferred Date
@@ -372,23 +686,47 @@ export const PatientDashboard: React.FC = () => {
                 <input
                   type="date"
                   value={appointmentDate}
-                  onChange={(e) => setAppointmentDate(e.target.value)}
+                  min={getLocalDateValue(new Date())}
+                  onChange={(e) => {
+                    setAppointmentDate(e.target.value);
+                    setAppointmentTime('');
+                  }}
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-white"
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Preferred Time Slot
+                  Available Time Slot
                 </label>
-                <input
-                  type="time"
+                <select
+                  required
                   value={appointmentTime}
+                  disabled={!selectedDoctor || availabilityLoading || !availableSlots.some(slot => slot.available)}
                   onChange={(e) => setAppointmentTime(e.target.value)}
-                  className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-white"
-                />
+                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-white disabled:opacity-60"
+                >
+                  <option value="">
+                    {availabilityLoading ? 'Checking availability…' :
+                      !selectedDoctor ? 'No available doctor in this department' :
+                        availableSlots.some(slot => slot.available) ? 'Select an available time' : 'No available times'}
+                  </option>
+                  {availableSlots.map(slot => (
+                    <option key={slot.appointment_time} value={slot.appointment_time} disabled={!slot.available}>
+                      {new Date(`2000-01-01T${slot.appointment_time}`).toLocaleTimeString([], {
+                        hour: 'numeric',
+                        minute: '2-digit',
+                      })}{slot.available ? ' · Available' : ` · ${slot.reason || 'Booked'}`}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">
+                  {selectedDoctor
+                    ? `${selectedDoctor.avg_consultation_minutes}-minute consultation plus a ${APPOINTMENT_BUFFER_MINUTES}-minute buffer.`
+                    : 'Select a department with an available doctor.'}
+                </p>
               </div>
-            </div>
+            </div>}
 
             <div>
               <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
@@ -403,15 +741,90 @@ export const PatientDashboard: React.FC = () => {
               />
             </div>
 
+            {(bookingError || availabilityError) && (
+              <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-semibold text-rose-700 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-300">
+                {bookingError || availabilityError}
+              </div>
+            )}
+            {bookingNotice && (
+              <div role="status" className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs font-semibold text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300">
+                {bookingNotice}
+              </div>
+            )}
+
             <button
               type="submit"
-              disabled={isGenerating}
+              disabled={isGenerating || appointmentSubmitting || availabilityLoading ||
+                (bookingMode === 'APPOINTMENT' && (!selectedDoctor || !appointmentTime ||
+                  !availableSlots.some(slot => slot.appointment_time.slice(0, 5) === appointmentTime.slice(0, 5) && slot.available)))}
               className="w-full py-3 rounded-xl bg-gradient-to-r from-sky-600 to-teal-600 hover:from-sky-700 hover:to-teal-700 text-white font-bold text-xs shadow-lg shadow-sky-600/25 flex items-center justify-center gap-2"
             >
-              <QrCode className="w-4 h-4" />
-              <span>{isGenerating ? 'Generating Official Token...' : 'Generate Instant QR Appointment Ticket'}</span>
+              {bookingMode === 'WALKIN' && <QrCode className="w-4 h-4" />}
+              <span>{appointmentSubmitting ? 'Booking appointment…' : isGenerating
+                ? 'Generating Official Token...'
+                : bookingMode === 'APPOINTMENT' ? 'Confirm Appointment' : 'Generate Instant QR Walk-in Ticket'}</span>
             </button>
           </form>
+        </div>
+      )}
+
+      {appointments.some(appointment => appointment.patient_id === user?.id) && (
+        <div className="bg-white dark:bg-slate-800 rounded-3xl p-6 sm:p-8 border border-slate-200 dark:border-slate-700 shadow-sm space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-base font-bold text-slate-900 dark:text-white">Your Appointments</h2>
+            <span className="text-xs text-slate-400">
+              {appointments.filter(appointment => appointment.patient_id === user?.id).length} records
+            </span>
+          </div>
+          <div className="divide-y divide-slate-100 dark:divide-slate-700">
+            {appointments.filter(appointment => appointment.patient_id === user?.id)
+              .sort((a, b) => `${b.appointment_date}T${b.appointment_time}`.localeCompare(`${a.appointment_date}T${a.appointment_time}`))
+              .map(appointment => {
+                const department = departments.find(item => item.id === appointment.department_id);
+                const doctor = doctors.find(item => item.id === appointment.doctor_id);
+                return (
+                  <div key={appointment.id} className="flex flex-wrap items-center gap-3 py-3 first:pt-0 last:pb-0">
+                    <Calendar className="h-5 w-5 text-sky-600" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-bold text-slate-900 dark:text-white">{department?.name || 'Department'}</p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        {appointment.appointment_date} at {appointment.appointment_time.slice(0, 5)}
+                        {doctor ? ` · ${doctor.specialization}` : ''}
+                        {appointment.duration_minutes ? ` · ${appointment.duration_minutes} min` : ''}
+                      </p>
+                    </div>
+                    <span className={`rounded-full px-2.5 py-1 text-[10px] font-bold ${
+                      appointment.status === 'CANCELLED'
+                        ? 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
+                        : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+                    }`}>{appointment.status.toLowerCase().replace('_', ' ')}</span>
+                    {appointment.status === 'CONFIRMED' && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => startRescheduling(appointment)}
+                          className="rounded-lg px-2.5 py-1.5 text-xs font-bold text-sky-700 hover:bg-sky-50 dark:hover:bg-sky-950/40"
+                        >
+                          Reschedule
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleCancelAppointment(appointment)}
+                          className="rounded-lg px-2.5 py-1.5 text-xs font-bold text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+          </div>
+          {appointments.some(appointment => appointment.patient_id === user?.id && appointment.id.startsWith('demo-appt-')) && (
+            <p className="text-[10px] text-amber-700 dark:text-amber-300">
+              Demo appointments are stored only in this browser and do not reserve a shared clinic slot.
+            </p>
+          )}
         </div>
       )}
 

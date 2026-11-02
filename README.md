@@ -186,7 +186,11 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
    * Run [`database/01_schema.sql`](database/01_schema.sql)
    * Run [`database/02_rls_and_triggers.sql`](database/02_rls_and_triggers.sql)
    * Run [`database/03_seed_data.sql`](database/03_seed_data.sql)
-4. Copy your **Project URL** and **Anon Key** from `Project Settings -> API` into your Netlify / `.env` configuration.
+   * Run [`database/04_appointment_scheduling.sql`](database/04_appointment_scheduling.sql) to enable appointment slot availability, the five-minute buffer, cancellation/rescheduling RPCs, and database-enforced concurrent booking protection.
+4. Configure Supabase Auth for patient accounts and ensure patient profiles are linked to their Auth users through `profiles.auth_id`. Booking RPCs require a signed-in Supabase Auth session.
+5. Copy your **Project URL** and **Anon Key** from `Project Settings -> API` into your Netlify / `.env` configuration.
+
+> **Appointment booking:** Authenticated bookings are persisted in Supabase and protected by a PostgreSQL exclusion constraint. Without a Supabase Auth session, the app offers a local demo booking stored only in the current browser; it is not a shared reservation and cannot prevent bookings from other devices.
 
 ---
 
