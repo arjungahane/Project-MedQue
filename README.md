@@ -187,10 +187,10 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
    * Run [`database/02_rls_and_triggers.sql`](database/02_rls_and_triggers.sql)
    * Run [`database/03_seed_data.sql`](database/03_seed_data.sql)
    * Run [`database/04_appointment_scheduling.sql`](database/04_appointment_scheduling.sql) to enable appointment slot availability, the five-minute buffer, cancellation/rescheduling RPCs, and database-enforced concurrent booking protection.
-4. Configure Supabase Auth for patient accounts and ensure patient profiles are linked to their Auth users through `profiles.auth_id`. Booking RPCs require a signed-in Supabase Auth session.
+4. Enable Supabase Auth email/password sign-in. Patient registration creates an Auth account and links its profile using `profiles.auth_id`; confirm the Auth email if email confirmation is enabled. Provision staff, doctors, and administrators as Supabase Auth users and link their profile rows before they sign in.
 5. Copy your **Project URL** and **Anon Key** from `Project Settings -> API` into your Netlify / `.env` configuration.
 
-> **Appointment booking:** Authenticated bookings are persisted in Supabase and protected by a PostgreSQL exclusion constraint. Without a Supabase Auth session, the app offers a local demo booking stored only in the current browser; it is not a shared reservation and cannot prevent bookings from other devices.
+> **Appointment booking:** With Supabase configured, sign-in requires valid Supabase Auth credentials and authenticated bookings are persisted in Supabase with a PostgreSQL exclusion constraint. The scheduling migration defaults the clinic timezone to `Asia/Kolkata`; update `medqueue_settings.clinic_timezone` to the hospital's IANA timezone before production use if the clinic is elsewhere. Without Supabase configuration, the app uses local demo profiles and appointments stored only in the current browser; these are not shared reservations and cannot prevent bookings from other devices. The seeded evaluator accounts are local demo accounts only; they are not provisioned Supabase Auth users.
 
 ---
 
@@ -212,7 +212,7 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 
 ## 🔑 Demo Evaluator Accounts
 
-For quick college project reviews, MedQueue features a **1-Click Role Switcher** in the navigation bar. You can also sign in manually:
+For quick college project reviews without Supabase credentials, MedQueue features a **1-Click Role Switcher** in the navigation bar. These local demo accounts are only available in demo mode:
 
 | Role | Email | Password | Access Highlights |
 |---|---|---|---|

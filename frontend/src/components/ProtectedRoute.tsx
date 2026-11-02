@@ -3,6 +3,7 @@ import { Navigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { UserRole } from '../types';
 import { ShieldAlert, ArrowRight } from 'lucide-react';
+import { isSupabaseConfigured } from '../lib/supabase';
 
 interface ProtectedRouteProps {
   children: React.ReactNode;
@@ -10,7 +11,15 @@ interface ProtectedRouteProps {
 }
 
 export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, allowedRoles }) => {
-  const { user, role, isAuthenticated, quickLoginAs } = useAuth();
+  const { user, role, isAuthenticated, isLoading, quickLoginAs } = useAuth();
+
+  if (isLoading) {
+    return (
+      <div className="min-h-[70vh] flex items-center justify-center" role="status">
+        <span className="text-sm font-semibold text-slate-500">Restoring your secure session…</span>
+      </div>
+    );
+  }
 
   if (!isAuthenticated || !user) {
     return <Navigate to="/auth" replace />;
@@ -32,7 +41,7 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, allowe
             This module requires <strong className="text-slate-800 dark:text-slate-200 uppercase">{requiredRole}</strong> access. You are currently logged in as <strong className="uppercase">{role}</strong>.
           </p>
 
-          <div className="pt-2">
+          {!isSupabaseConfigured && <div className="pt-2">
             <button
               onClick={() => quickLoginAs(requiredRole)}
               className="w-full py-3 px-4 rounded-xl bg-sky-600 hover:bg-sky-700 text-white font-bold text-xs flex items-center justify-center gap-2 shadow-lg shadow-sky-600/20 transition-all hover:scale-[1.02]"
@@ -40,7 +49,7 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, allowe
               <span>Instant Switch to {requiredRole.toUpperCase()} Demo Account</span>
               <ArrowRight className="w-4 h-4" />
             </button>
-          </div>
+          </div>}
         </div>
       </div>
     );

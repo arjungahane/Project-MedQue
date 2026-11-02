@@ -10,7 +10,15 @@ export interface AppointmentSlot {
 }
 
 function toMinutes(value: string) {
-  const [hours, minutes] = value.slice(0, 5).split(':').map(Number);
+  const match = /^(\d{2}):(\d{2}):(\d{2})$/.exec(value);
+  if (!match) throw new RangeError('This doctor has invalid working hours.');
+  const [, hourText, minuteText, secondText] = match;
+  const hours = Number(hourText);
+  const minutes = Number(minuteText);
+  const seconds = Number(secondText);
+  if (hours > 23 || minutes > 59 || seconds !== 0) {
+    throw new RangeError('This doctor has invalid working hours.');
+  }
   return hours * 60 + minutes;
 }
 
@@ -46,8 +54,11 @@ export function getAvailableAppointmentSlots(
 
   const doctorDays = doctor.available_days || ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
   const weekday = selectedDate.toLocaleDateString('en-US', { weekday: 'long' });
-  const opening = toMinutes(doctor.start_time || '09:00');
-  const closing = toMinutes(doctor.end_time || '17:00');
+  const opening = toMinutes(doctor.start_time || '09:00:00');
+  const closing = toMinutes(doctor.end_time || '17:00:00');
+  if (closing <= opening) {
+    throw new RangeError('This doctor has invalid working hours.');
+  }
   const lastStart = closing - duration - APPOINTMENT_BUFFER_MINUTES;
   if (!doctorDays.includes(weekday)) return [];
 

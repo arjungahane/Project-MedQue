@@ -19,6 +19,7 @@ import { useAuth } from '../context/AuthContext';
 import { useQueue } from '../context/QueueContext';
 import { useTheme } from '../context/ThemeContext';
 import { UserRole } from '../types';
+import { isSupabaseConfigured } from '../lib/supabase';
 
 export const Navbar: React.FC = () => {
   const { user, role, logout, quickLoginAs, isAuthenticated } = useAuth();
@@ -148,7 +149,7 @@ export const Navbar: React.FC = () => {
           <div className="flex items-center gap-2 sm:gap-3">
 
             {/* Quick Demo Role Switcher Dropdown */}
-            <div className="relative">
+            {!isSupabaseConfigured && <div className="relative">
               <button
                 onClick={() => setShowRoleMenu(prev => !prev)}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"
@@ -223,7 +224,7 @@ export const Navbar: React.FC = () => {
                   </button>
                 </div>
               )}
-            </div>
+            </div>}
 
             {/* Notification Drawer */}
             <div className="relative">

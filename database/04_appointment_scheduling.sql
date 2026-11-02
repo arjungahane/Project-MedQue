@@ -3,6 +3,45 @@
 
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
+CREATE TABLE IF NOT EXISTS medqueue_settings (
+  singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+  clinic_timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata'
+);
+
+INSERT INTO medqueue_settings (singleton, clinic_timezone)
+VALUES (true, 'Asia/Kolkata')
+ON CONFLICT (singleton) DO NOTHING;
+
+ALTER TABLE medqueue_settings ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE medqueue_settings FROM PUBLIC, anon, authenticated;
+
+CREATE OR REPLACE FUNCTION get_clinic_local_now()
+RETURNS TIMESTAMP
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  timezone_name TEXT;
+BEGIN
+  SELECT clinic_timezone INTO timezone_name
+  FROM medqueue_settings
+  WHERE singleton = true;
+
+  IF timezone_name IS NULL OR NOT EXISTS (
+    SELECT 1 FROM pg_timezone_names WHERE name = timezone_name
+  ) THEN
+    RAISE EXCEPTION 'Configure a valid clinic time zone in medqueue_settings.'
+      USING ERRCODE = '22023';
+  END IF;
+
+  RETURN now() AT TIME ZONE timezone_name;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION get_clinic_local_now() FROM PUBLIC, anon, authenticated;
+
 ALTER TABLE appointments
   ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 15;
 
@@ -20,6 +59,8 @@ ALTER TABLE appointments
 CREATE OR REPLACE FUNCTION validate_appointment_schedule()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   provider doctors%ROWTYPE;
@@ -45,8 +86,23 @@ BEGIN
         USING ERRCODE = '23514';
     END IF;
 
+    IF provider.avg_consultation_minutes IS NULL
+      OR provider.avg_consultation_minutes NOT BETWEEN 1 AND 180
+      OR provider.available_days IS NULL
+      OR cardinality(provider.available_days) = 0
+      OR provider.start_time IS NULL
+      OR provider.end_time IS NULL
+      OR provider.start_time >= provider.end_time
+      OR extract(hour FROM provider.start_time) >= 24
+      OR extract(hour FROM provider.end_time) >= 24
+      OR extract(second FROM provider.start_time) <> 0
+      OR extract(second FROM provider.end_time) <> 0 THEN
+      RAISE EXCEPTION 'The selected doctor has an invalid appointment schedule.'
+        USING ERRCODE = '23514';
+    END IF;
+
     weekday_name := btrim(to_char(NEW.appointment_date, 'FMDay'));
-    IF NOT (weekday_name = ANY(provider.available_days)) THEN
+    IF NOT COALESCE(weekday_name = ANY(provider.available_days), false) THEN
       RAISE EXCEPTION 'The selected doctor is not available on this date.'
         USING ERRCODE = '23514';
     END IF;
@@ -66,7 +122,7 @@ BEGIN
         USING ERRCODE = '23514';
     END IF;
 
-    IF NEW.appointment_date + NEW.appointment_time <= localtimestamp THEN
+    IF NEW.appointment_date + NEW.appointment_time <= get_clinic_local_now() THEN
       RAISE EXCEPTION 'Choose a future appointment time.'
         USING ERRCODE = '23514';
     END IF;
@@ -120,10 +176,16 @@ DECLARE
   slot_duration INTEGER;
   weekday_name TEXT;
   patient_profile_id UUID;
+  clinic_now TIMESTAMP;
 BEGIN
   IF auth.uid() IS NULL THEN
     RAISE EXCEPTION 'Sign in to check appointment availability.'
       USING ERRCODE = '28000';
+  END IF;
+
+  IF p_date IS NULL THEN
+    RAISE EXCEPTION 'Choose a valid appointment date.'
+      USING ERRCODE = '22023';
   END IF;
 
   SELECT * INTO provider
@@ -135,8 +197,24 @@ BEGIN
     RAISE EXCEPTION 'The selected doctor is unavailable.'
       USING ERRCODE = '22023';
   END IF;
+  clinic_now := get_clinic_local_now();
 
-  IF p_date < current_date THEN
+  IF provider.avg_consultation_minutes IS NULL
+    OR provider.avg_consultation_minutes NOT BETWEEN 1 AND 180
+    OR provider.available_days IS NULL
+    OR cardinality(provider.available_days) = 0
+    OR provider.start_time IS NULL
+    OR provider.end_time IS NULL
+    OR provider.start_time >= provider.end_time
+    OR extract(hour FROM provider.start_time) >= 24
+    OR extract(hour FROM provider.end_time) >= 24
+    OR extract(second FROM provider.start_time) <> 0
+    OR extract(second FROM provider.end_time) <> 0 THEN
+    RAISE EXCEPTION 'The selected doctor has an invalid appointment schedule.'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_date < clinic_now::DATE THEN
     RAISE EXCEPTION 'Choose a future appointment date.'
       USING ERRCODE = '22023';
   END IF;
@@ -171,11 +249,11 @@ BEGIN
       (p_date + (provider.end_time - make_interval(mins => slot_duration + 5)))::TIMESTAMP,
       INTERVAL '5 minutes'
     ) AS generated(slot)
-    WHERE weekday_name = ANY(provider.available_days)
+    WHERE COALESCE(weekday_name = ANY(provider.available_days), false)
   )
   SELECT
     candidates.slot_time,
-    p_date + candidates.slot_time > localtimestamp
+    p_date + candidates.slot_time > clinic_now
       AND NOT EXISTS (
         SELECT 1
         FROM appointments AS booked
@@ -195,8 +273,8 @@ BEGIN
           )
       ) AS is_available,
     CASE
-      WHEN weekday_name <> ALL(provider.available_days) THEN 'Doctor unavailable on this day'
-      WHEN p_date + candidates.slot_time <= localtimestamp THEN 'This time has passed'
+      WHEN NOT COALESCE(weekday_name = ANY(provider.available_days), false) THEN 'Doctor unavailable on this day'
+      WHEN p_date + candidates.slot_time <= clinic_now THEN 'This time has passed'
       WHEN EXISTS (
         SELECT 1
         FROM appointments AS booked
@@ -381,7 +459,7 @@ BEGIN
 
   SELECT id INTO patient_profile_id
   FROM profiles
-  WHERE auth_id = auth.uid()
+  WHERE (auth_id = auth.uid() OR id = auth.uid())
     AND role = 'patient';
 
   RETURN QUERY
