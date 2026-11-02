@@ -1,17 +1,10 @@
 [build]
-  base = "."
-  command = "npm --prefix frontend run build"
-  publish = "frontend/dist"
-  functions = "netlify/functions"
+  base = "frontend"
+  command = "npm run build"
+  publish = "dist"
 
 [build.environment]
   NODE_VERSION = "20"
-
-# Serverless function redirects
-[[redirects]]
-  from = "/api/*"
-  to = "/.netlify/functions/api/:splat"
-  status = 200
 
 # Single Page App routing redirect for React Router
 [[redirects]]

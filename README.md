@@ -200,9 +200,9 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 2. Log in to [Netlify](https://app.netlify.com) and click **"Add new site" -> "Import an existing project"**.
 3. Select your newly created `MedQueue` repository.
 4. Netlify will automatically detect `netlify.toml`:
-   * **Build command**: `npm --prefix frontend run build`
-   * **Publish directory**: `frontend/dist`
-   * **Functions directory**: `netlify/functions`
+   * **Base directory**: `frontend` (installs dependencies from `frontend/package-lock.json`)
+   * **Build command**: `npm run build`
+   * **Publish directory**: `dist`
 5. In **Site Configuration -> Environment variables**, add:
    * `VITE_SUPABASE_URL`
    * `VITE_SUPABASE_ANON_KEY`
